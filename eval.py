@@ -12,11 +12,47 @@ import jiwer  # You must install this: pip install jiwer
 # Model input shape (1, 296, 39)
 INPUT_SIZE = 1 * 296 * 39  # 11544 bytes
 # How many bytes of *data* to send per 'db' command (256 hex chars = 128 bytes)
-SEND_BYTES_PER_CMD = 128
+SEND_BYTES_PER_CMD = 32
 
 # Serial protocol
 READY_MSG = 'm-ready\r\n'
 # --- End Configuration ---
+
+def ctc_greedy_decoder_py(output_tensor):
+    """
+    Decodes the raw 4292-element output tensor from Wav2letter.
+    """
+    kAlphabet = "abcdefghijklmnopqrstuvwxyz' @"
+    kBlankToken = 28
+    kNumClasses = 29
+    num_timesteps = 148
+
+    # Ensure we have the correct amount of data
+    if len(output_tensor) != num_timesteps * kNumClasses:
+        return "[DECODER_ERROR: WRONG_TENSOR_SIZE]"
+
+    prev_token = -1
+    result_str = []
+
+    # Iterate over each of the 148 timesteps
+    for t in range(num_timesteps):
+        # Find the slice of 29 scores for this timestep
+        timestep_scores = output_tensor[t * kNumClasses : (t + 1) * kNumClasses]
+        
+        # Find the class (0-28) with the highest score
+        max_index = np.argmax(timestep_scores)
+        
+        # Apply CTC greedy logic
+        if max_index != kBlankToken and max_index != prev_token:
+            if max_index < len(kAlphabet):
+                result_str.append(kAlphabet[max_index])
+        
+        if max_index == kBlankToken:
+            prev_token = -1
+        else:
+            prev_token = max_index
+            
+    return "".join(result_str).strip()
 
 def parse_arg():
     """Parses command line arguments."""
@@ -38,7 +74,7 @@ class TestCase:
 # Helper function to read and print messages
 def read_and_print(com, until_msg):
     msg = com.read_until(until_msg.encode()).decode('utf-8', 'ignore')
-    print(f"BOARD: {msg.strip()}")
+    # print(f"BOARD: {msg.strip()}")
     return msg
         
 if __name__ == '__main__':
@@ -65,7 +101,6 @@ if __name__ == '__main__':
 
     # --- Connect to Serial ---
     try:
-        # Use a long timeout for 10-minute inference
         com = serial.Serial(args.port, args.baud, timeout=900) # 15-minute timeout
         print(f"Connected to {args.port} at {args.baud} baud.")
     except Exception as e:
@@ -106,9 +141,6 @@ if __name__ == '__main__':
                 raise FileNotFoundError# Skip to next test case
             input_data = np.fromfile(testcase.filename, dtype=np.int8)
                 
-            # if len(input_data) != INPUT_SIZE:
-            #     print(f"\nSkipping {testcase.filename}: incorrect size.")
-            #     continue
             with open(testcase.filename, 'rb') as test_input:
                 com.read_all() # Clear any old data
                 db_load_cmd = f"db load {INPUT_SIZE}%"
@@ -122,7 +154,6 @@ if __name__ == '__main__':
                 while len(data_chunk) > 0:
                     db_data_cmd = f"db {data_chunk.hex()}%"
                     com.write(db_data_cmd.encode())
-                    # Don't print the 361 "m-ready" messages
                     com.read_until(READY_MSG.encode()) 
                     bytes_sent += len(data_chunk)
                     data_chunk = test_input.read(SEND_BYTES_PER_CMD)
@@ -133,7 +164,6 @@ if __name__ == '__main__':
             com.write(infer_cmd.encode())
             
                 
-            # <<< MODIFIED: This is the new byte-by-byte loop to print dots >>>
             print(f"\n... Inference for '{testcase.filename}' running (will print dots):")
             msg_buffer_bytes = b''
             while True:
@@ -164,19 +194,17 @@ if __name__ == '__main__':
                 
             # Parse Text Result
             try:
-                m = re.search(r'm-results-s\[(.*?)\]', msg)
-                predicted_text = m.group(1).lower().strip()
+                m = re.search(r'm-results-\[(.*?)\]', msg)
+                output_tensor = [int(x) for x in m.group(1).split(',')]
+                predicted_text = ctc_greedy_decoder_py(output_tensor)
             except Exception:
                 print(f"Error parsing results string. Full message:\n{msg}")
-                continue
+                continue            
 
-            # 6. Store results for accuracy calculation
-            all_truth.append(testcase.ground_truth)
-            all_preds.append(predicted_text)
-            
             print(f"  Truth: '{testcase.ground_truth}'")
             print(f"  Pred:  '{predicted_text}'")
-
+            all_truth.append(testcase.ground_truth)
+            all_preds.append(predicted_text)
     finally:
         com.close()
 

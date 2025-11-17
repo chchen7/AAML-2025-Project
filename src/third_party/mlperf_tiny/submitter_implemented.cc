@@ -25,23 +25,19 @@ in th_results is copied from the original in EEMBC.
 
 #include "third_party/mlperf_tiny/api/internally_implemented.h"
 #include "third_party/mlperf_tiny/util/quantization_helpers.h"
-#include "../../ctc_decoder.h"
 #include <stdio.h>
 
-// <<< MODIFIED: Include the correct model header
-// This assumes the variables inside are 'wav2letter_pruned_int8' and 'wav2letter_pruned_int8_len'
 #include "../../wav2letter/model/wav2letter_pruned_int8.h" 
 
 #include "menu.h"
 #include "../../tflite.h"
 #include "../../perf.h"
 
-// <<< MODIFIED: Set correct input size (1 * 296 * 39)
+// Set correct input size (1 * 296 * 39)
 const int kInputSize = 11544;
 
 // Implement this method to prepare for inference and preprocess inputs.
 void th_load_tensor() {
-  // <<< MODIFIED: Use the correct input size
   uint8_t input_quantized[kInputSize];
 
   size_t bytes = ee_get_buffer(reinterpret_cast<uint8_t *>(input_quantized),
@@ -52,14 +48,7 @@ void th_load_tensor() {
     return;
   }
  
-  // <<< MODIFIED: Removed the data corruption loop.
-  // The input data is already in the correct signed int8_t format.
-  // We just need to cast the pointer.
- 
   tflite_set_input(reinterpret_cast<int8_t*>(input_quantized));
-  
-  // <<< MODIFIED: Removed non-existent function
-  // tflite_invoke_pre(); 
 }
 
 // Add to this method to return real inference results.
@@ -82,21 +71,6 @@ void th_results() {
   }
   th_printf("]\r\n");
 }
-// void th_results() {
-//   // 1. Get the raw 4292-byte output tensor
-//   int8_t* output_tensor = tflite_get_output();
-
-//   // 2. Create a buffer for the decoded string
-//   //    (148 timesteps + 1 null terminator)
-//   char decoded_string[149]; 
-
-//   // 3. Run the CTC decoder on the tensor
-//   ctc_greedy_decoder(output_tensor, decoded_string, 149);
-
-//   // 4. Print the result in the NEW string format
-//   //    The Python script looks for "m-results-s["
-//   th_printf("m-results-s[%s]\r\n", decoded_string);
-// }
 
 // Implement this method with the logic to perform one inference cycle.
 void th_infer() { tflite_classify(); }
