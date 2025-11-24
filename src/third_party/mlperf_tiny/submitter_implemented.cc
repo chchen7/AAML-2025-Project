@@ -25,6 +25,7 @@ in th_results is copied from the original in EEMBC.
 
 #include "third_party/mlperf_tiny/api/internally_implemented.h"
 #include <stdio.h>
+#include <stdint.h>
 
 #include "../../wav2letter/model/wav2letter_pruned_int8.h" 
 
@@ -134,9 +135,9 @@ void th_timestamp(void) {
   }
   timestampPin = 1;
  #else
-  unsigned long microSeconds = 0ul;
+  uint64_t microSeconds = 0ull;
   /* USER CODE 2 BEGIN */
-  microSeconds = static_cast<unsigned long>(perf_get_mcycle64()/75);
+  microSeconds = perf_get_mcycle64() / 75;
   /* USER CODE 2 END */
   /* This message must NOT be changed. */
   th_printf(EE_MSG_TIMESTAMP, microSeconds);

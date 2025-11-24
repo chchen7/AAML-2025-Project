@@ -27,7 +27,7 @@ methods from th_libc.h and all testharness methods from th_lib.h are here.
 /// \brief These defines set logging prefixes for test harness integration.
 /// \detail This API is designed for performance evaluation only. In order to
 /// gather energy measurments we recommend using the EEMBC test suite.
-#define EE_MSG_TIMESTAMP "m-lap-us-%lu\r\n"
+#define EE_MSG_TIMESTAMP "m-lap-us-%llu\r\n"
 #define TH_VENDOR_NAME_STRING "NYCU-CAS-LAB"
 #define TH_MODEL_VERSION EE_MODEL_VERSION_IC01
 

@@ -172,8 +172,6 @@ if __name__ == '__main__':
                     print("\nError: Read timed out during inference!")
                     msg = msg_buffer_bytes.decode('utf-8', 'ignore')
                     break
-                # if byte_char == b'.':
-                #     print(byte_char.decode('utf-8', 'ignore'), end='', flush=True)
                 print(byte_char.decode('utf-8', 'ignore'), end='', flush=True)
                 msg_buffer_bytes += byte_char
                 if msg_buffer_bytes.endswith(READY_MSG.encode()):
@@ -186,6 +184,9 @@ if __name__ == '__main__':
             try:
                 m = [int(x) for x in re.findall(r'm-lap-us-([0-9]*)', msg)]
                 latency_us = (m[1] - m[0]) 
+                if latency_us < 0:
+                    print(f"\n[CRITICAL ERROR] Timer Overflow or Invalid Logic detected, EXITING!")
+                    exit(1)
                 results['total_latency_ms'] += (latency_us / 1000.0) # Convert us to ms
             except Exception:
                 print(f"Error parsing latency. Full message:\n{msg}")
