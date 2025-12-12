@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/portable_tensor_utils.h"
+#include "cfu.h"
 
 namespace tflite {
 namespace reference_integer_ops {
@@ -63,12 +64,12 @@ inline void ConvPerChannel(
   const int filter_height = filter_shape.Dims(1);
   const int filter_width = filter_shape.Dims(2);
   const int filter_input_depth = filter_shape.Dims(3);
-  const int groups = input_depth / filter_input_depth;
+  //const int groups = input_depth / filter_input_depth;
   TFLITE_DCHECK_EQ(input_depth % filter_input_depth, 0);
-  const int filters_per_group = output_depth / groups;
+  //const int filters_per_group = output_depth / groups;
   const int output_height = output_shape.Dims(1);
   const int output_width = output_shape.Dims(2);
-  for (int batch = 0; batch < batches; ++batch) {
+  /*for (int batch = 0; batch < batches; ++batch) {
     for (int out_y = 0; out_y < output_height; ++out_y) {
       const int in_y_origin = (out_y * stride_height) - pad_height;
       for (int out_x = 0; out_x < output_width; ++out_x) {
@@ -129,6 +130,156 @@ inline void ConvPerChannel(
           output_data[Offset(output_shape, batch, out_y, out_x, out_channel)] =
               static_cast<int8_t>(acc);
         }
+      }
+    }
+  }*/
+  int M = output_depth;
+  int N = output_height * output_width;
+  int K = filter_height * filter_width * input_depth;
+
+  int8_t im2col[8192][1024];
+  int8_t kernel[2048][8192];
+  int32_t cfu_result[2048][1024];
+
+  int col_idx = 0;
+  int stride_height_sum = 0;
+  for (int batch = 0; batch < batches; ++batch) { 
+    for (int out_y = 0; out_y < output_height; ++out_y) {
+      int in_y_origin = stride_height_sum - pad_height;
+      int stride_width_sum = 0;
+      for (int out_x = 0; out_x < output_width; ++out_x) {
+        int in_x_origin = stride_width_sum - pad_width;
+        int row_idx = 0;
+        int in_y = in_y_origin; 
+        for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+          int in_x = in_x_origin;
+          for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
+            for (int in_channel = 0; in_channel < input_depth; ++in_channel) {
+              int8_t val = 0;
+              bool is_point_inside_image =
+                    (in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
+                    (in_y < input_height);
+              if (is_point_inside_image) {
+                int8_t real_val = input_data[Offset(input_shape, 0, in_y, in_x, in_channel)];
+                val = static_cast<int8_t>(real_val);
+              } else {
+                val = static_cast<int8_t>(-input_offset);; 
+              }
+
+              im2col[row_idx][col_idx] = val;
+              row_idx++;
+            }
+            in_x += dilation_width_factor;
+          }
+          in_y += dilation_height_factor;
+        }
+        col_idx++;
+        stride_width_sum += stride_width;
+      }
+      stride_height_sum += stride_height; 
+    }
+
+    for (int m = 0; m < M; ++m) {
+      int k_idx = 0;
+      int32_t sum = 0;
+      for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+        for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
+          for (int in_channel = 0; in_channel < input_depth; ++in_channel) {
+            int8_t filter_val = filter_data[Offset(filter_shape, m, filter_y, filter_x, in_channel)];
+            kernel[m][k_idx] = filter_val;
+            sum += filter_val;
+            k_idx++;
+          }
+        }
+      }
+      int32_t tmp = sum * input_offset;
+      for(int n = 0; n < N; ++n) {
+        cfu_result[m][n] = tmp;
+      }
+    }
+    
+    const int TILE_SIZE = 128;
+    
+    for (int m = 0; m < M; m += TILE_SIZE) {
+      for (int n = 0; n < N; n += TILE_SIZE) {
+        for (int k = 0; k < K; k += TILE_SIZE) {
+          // send to im2col buffer
+          uint32_t addr = 0; 
+          for (int tn = 0; tn < TILE_SIZE; tn += 4) {
+            for (int tk = 0; tk < TILE_SIZE; tk += 4) { 
+              for(int r = 0; r < 4; ++r) {
+                uint32_t packed_val = 0;
+                int cur_n = n + tn; 
+                int cur_k = k + tk + r;     
+                packed_val = *reinterpret_cast<const uint32_t*>(im2col[cur_k]+cur_n);
+                packed_val = __builtin_bswap32(packed_val);
+                cfu_op0(0, packed_val, (1<<24) + addr);    
+                addr++;
+              }    
+            }
+          }
+          // send to kernel buffer
+          addr = 0; 
+          for (int tm = 0; tm < TILE_SIZE; tm += 4) {
+            for (int tk = 0; tk < TILE_SIZE; tk+=4) {
+              for(int r = 0; r < 4; ++r) {
+                uint32_t packed_val = 0;
+                int cur_k = k + tk + r; 
+                for (int i = 0; i < 4; ++i) {
+                  int cur_m = m + tm + i; 
+                  int8_t val = 0;
+                  if (cur_m < M && cur_k < K) {
+                    val = kernel[cur_m][cur_k];
+                  }
+                  packed_val |= ((uint32_t)((uint8_t)val)) << ((4-i-1) <<3);
+                }
+                cfu_op0(0, packed_val, addr); 
+                addr++;
+              }
+            }
+          }
+          // receive from output buffer
+          cfu_op0(1,TILE_SIZE|(TILE_SIZE<<8)|(TILE_SIZE<<16),0);
+
+          uint32_t num_row_blocks = TILE_SIZE / 4; 
+          for (uint32_t i = 0; i < TILE_SIZE; i++) { 
+            uint32_t block_row = i >> 2; 
+            uint32_t inner_row = i % 4; 
+            for (uint32_t j = 0; j < TILE_SIZE; j++) { 
+              uint32_t block_col = j >> 2; 
+              
+              uint32_t buffer_index = ((block_col * num_row_blocks + block_row) << 2) + inner_row;
+              
+              uint32_t offset = j % 4;
+
+              int32_t ret = static_cast<int32_t>(cfu_op0(2, buffer_index, offset));
+
+              int global_m = m + i;
+              int global_n = n + j;
+
+              if (global_m < M && global_n < N) { 
+                cfu_result[global_m][global_n] += ret; 
+              }
+            }
+          }
+        }
+      }
+    }
+    for (int m = 0; m < M; ++m) {
+      for (int n = 0; n < N; ++n) {
+        int32_t acc = cfu_result[m][n];
+
+        if (bias_data) {
+          acc += bias_data[m];
+        }
+        acc = MultiplyByQuantizedMultiplier(
+        acc, output_multiplier[m], output_shift[m]);
+        acc += output_offset;
+        acc = std::max(acc, output_activation_min);
+        acc = std::min(acc, output_activation_max);
+        int out_y = n / output_width;
+        int out_x = n % output_width;
+        output_data[Offset(output_shape, batch, out_y, out_x, m)] = static_cast<int8_t>(acc);
       }
     }
   }

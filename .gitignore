@@ -1,6 +1,6 @@
 # Ignore build artifacts
 build/
-
+venv/
 *.tflite
 
 src/wav2letter/model/wav2letter_pruned_int8.h
