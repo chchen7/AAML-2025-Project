@@ -198,7 +198,7 @@ inline void ConvPerChannel(
       }
     }
     
-    const int TILE_SIZE = 128;
+    const int TILE_SIZE = 256;
     
     for (int m = 0; m < M; m += TILE_SIZE) {
       for (int n = 0; n < N; n += TILE_SIZE) {
@@ -239,7 +239,7 @@ inline void ConvPerChannel(
             }
           }
           // receive from output buffer
-          cfu_op0(1,TILE_SIZE|(TILE_SIZE<<8)|(TILE_SIZE<<16),0);
+          cfu_op0(1,TILE_SIZE|(TILE_SIZE<<16),(TILE_SIZE));
 
           uint32_t num_row_blocks = TILE_SIZE / 4; 
           for (uint32_t i = 0; i < TILE_SIZE; i++) { 

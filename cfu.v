@@ -36,9 +36,9 @@ module Cfu (
   wire busy;
   wire rst_n = ~reset;
 
-  wire [7:0] K = cmd_payload_inputs_0[23:16];
-  wire [7:0] M = cmd_payload_inputs_0[7:0];
-  wire [7:0] N = cmd_payload_inputs_0[15:8];
+  wire [8:0] K = cmd_payload_inputs_1[15:0];
+  wire [8:0] M = cmd_payload_inputs_0[15:0];
+  wire [8:0] N = cmd_payload_inputs_0[31:16];
   reg [1:0] mode;
 
   wire            in_valid_TPU = cmd_valid && cmd_ready && (cmd_payload_function_id == 8);
@@ -180,7 +180,7 @@ module Cfu (
   );
 
    global_buffer_bram #(
-      .ADDR_BITS(12),
+      .ADDR_BITS(14),
       .DATA_BITS(32)
   )
   gbuff_A(
@@ -194,7 +194,7 @@ module Cfu (
   );
 
    global_buffer_bram #(
-      .ADDR_BITS(12),
+      .ADDR_BITS(14),
       .DATA_BITS(32)
   ) gbuff_B(
       .clk(clk),
@@ -208,7 +208,7 @@ module Cfu (
 
 
    global_buffer_bram #(
-      .ADDR_BITS(12),
+      .ADDR_BITS(14),
       .DATA_BITS(128)
   ) gbuff_C(
       .clk(clk),

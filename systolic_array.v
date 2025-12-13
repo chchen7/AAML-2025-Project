@@ -3,9 +3,9 @@ module SYSTOLIC_ARRAY(
     input                 clk,
     input                 rst_n,
     input                 in_valid,
-    input       [7:0]     K,
-    input       [7:0]     M,
-    input       [7:0]     N,
+    input       [8:0]     K,
+    input       [8:0]     M,
+    input       [8:0]     N,
     output  reg           busy,
 
     output                A_wr_en,
@@ -24,9 +24,9 @@ module SYSTOLIC_ARRAY(
     input       [127:0]   C_data_out
 );
     
-    reg [7:0] M_reg;
-    reg [7:0] N_reg;
-    reg [7:0] K_reg;
+    reg [8:0] M_reg;
+    reg [8:0] N_reg;
+    reg [8:0] K_reg;
     reg [2:0] C_data_in_sel;
     reg load_en;
     reg [2:0] cnt;
@@ -69,10 +69,10 @@ module SYSTOLIC_ARRAY(
     
 
     reg [15:0] n; 
-    reg [7:0] Nd4;
-    reg [7:0] Nr4;
-    reg [7:0] Md4;
-    reg [7:0] Mr4;
+    reg [8:0] Nd4;
+    reg [8:0] Nr4;
+    reg [8:0] Md4;
+    reg [8:0] Mr4;
     reg [15:0] A_len;
     reg  [2:0] limit;
     
