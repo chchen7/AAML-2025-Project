@@ -16,10 +16,26 @@ limitations under the License.
 #define TENSORFLOW_LITE_KERNELS_INTERNAL_REFERENCE_INTEGER_OPS_CONV_H_
 
 #include <algorithm>
+#include <cstdint>
 
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/portable_tensor_utils.h"
 #include "cfu.h"
+#include <stdio.h>
+
+// ---- CFU conv performance knobs ----
+
+// 0 = always write A/B (usually faster on VexRiscv unless you have strong temporal locality)
+// 1 = compare+skip writes if unchanged
+#ifndef CFU_CONV_USE_WRITE_CACHE
+#define CFU_CONV_USE_WRITE_CACHE 0
+#endif
+
+// If ALL weights of the current (m0 tile) are zero at some local-k, then B at that local-k
+// does not affect any output in this tile; we can skip writing B for that local-k.
+#ifndef CFU_CONV_SKIP_B_IF_ALLZERO_K
+#define CFU_CONV_SKIP_B_IF_ALLZERO_K 1
+#endif
 
 namespace tflite {
 namespace reference_integer_ops {
@@ -64,225 +80,343 @@ inline void ConvPerChannel(
   const int filter_height = filter_shape.Dims(1);
   const int filter_width = filter_shape.Dims(2);
   const int filter_input_depth = filter_shape.Dims(3);
-  //const int groups = input_depth / filter_input_depth;
   TFLITE_DCHECK_EQ(input_depth % filter_input_depth, 0);
-  //const int filters_per_group = output_depth / groups;
   const int output_height = output_shape.Dims(1);
   const int output_width = output_shape.Dims(2);
-  /*for (int batch = 0; batch < batches; ++batch) {
-    for (int out_y = 0; out_y < output_height; ++out_y) {
-      const int in_y_origin = (out_y * stride_height) - pad_height;
-      for (int out_x = 0; out_x < output_width; ++out_x) {
-        const int in_x_origin = (out_x * stride_width) - pad_width;
-        for (int out_channel = 0; out_channel < output_depth; ++out_channel) {
-          auto group = out_channel / filters_per_group;
-          int32_t acc = 0;
-          for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
-            const int in_y = in_y_origin + dilation_height_factor * filter_y;
-            for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
-              const int in_x = in_x_origin + dilation_width_factor * filter_x;
 
-              // Zero padding by omitting the areas outside the image.
-              const bool is_point_inside_image =
-                  (in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
-                  (in_y < input_height);
+  // GEMM dims
+  const int M = output_depth;
+  const int N = output_height * output_width;
+  const int K = filter_height * filter_width * input_depth;
 
-              if (!is_point_inside_image) {
-                continue;
-              }
+  // ---- Keep your original max sizes ----
+  static constexpr int IM2COL_MAX_K = 8192;
+  static constexpr int IM2COL_MAX_N = 1024;
 
-              for (int in_channel = 0; in_channel < filter_input_depth;
-                   ++in_channel) {
-                int32_t input_val =
-                    input_data[Offset(input_shape, batch, in_y, in_x,
-                                      in_channel + group * filter_input_depth)];
-                int32_t filter_val = filter_data[Offset(
-                    filter_shape, out_channel, filter_y, filter_x, in_channel)];
-                // Accumulate with 32 bits accumulator.
-                // In the nudging process during model quantization, we force
-                // real value of 0.0 be represented by a quantized value. This
-                // guarantees that the input_offset is a int8_t, even though
-                // it is represented using int32_t. int32_t += int8_t *
-                // (int8_t - int8_t) so the highest value we can get from each
-                // accumulation is [-127, 127] * ([-128, 127] -
-                // [-128, 127]), which is [-32512, 32512]. log2(32512)
-                // = 14.98, which means we can accumulate at least 2^16
-                // multiplications without overflow. The accumulator is
-                // applied to a filter so the accumulation logic will hold as
-                // long as the filter size (filter_y * filter_x * in_channel)
-                // does not exceed 2^16, which is the case in all the models
-                // we have seen so far.
-                // TODO(b/174275578): Add a check to make sure the
-                // accumulator depth is smaller than 2^16.
-                acc += filter_val * (input_val + input_offset);
-              }
-            }
-          }
+  // Fixed physical tile size used by your TPU buffers.
+  static constexpr int TM = 256;
+  static constexpr int TN = 256;
+  static constexpr int TK = 256;
 
-          if (bias_data) {
-            acc += bias_data[out_channel];
-          }
-          acc = MultiplyByQuantizedMultiplier(
-              acc, output_multiplier[out_channel], output_shift[out_channel]);
-          acc += output_offset;
-          acc = std::max(acc, output_activation_min);
-          acc = std::min(acc, output_activation_max);
-          output_data[Offset(output_shape, batch, out_y, out_x, out_channel)] =
-              static_cast<int8_t>(acc);
-        }
-      }
+  // im2col buffer (built once per batch; later we only pack what we need)
+  int8_t im2col[IM2COL_MAX_K][IM2COL_MAX_N];
+
+  // Per-output-channel correction term: sum(filter)*input_offset
+  int32_t offset_correction[2048];
+
+  // Accumulator for one (m0,n0) tile
+  int32_t tile_acc[TM * TN];
+
+#if CFU_CONV_USE_WRITE_CACHE
+  static uint32_t lastA[16384];
+  static uint32_t lastB[16384];
+  static bool last_inited = false;
+  if (!last_inited) {
+    for (int i = 0; i < 16384; ++i) {
+      lastA[i] = 0xFFFFFFFFu;
+      lastB[i] = 0xFFFFFFFFu;
     }
-  }*/
-  int M = output_depth;
-  int N = output_height * output_width;
-  int K = filter_height * filter_width * input_depth;
+    last_inited = true;
+  }
+#endif
 
-  int8_t im2col[8192][1024];
-  int8_t kernel[2048][8192];
-  int32_t cfu_result[2048][1024];
-
-  int col_idx = 0;
-  int stride_height_sum = 0;
-  for (int batch = 0; batch < batches; ++batch) { 
+  for (int batch = 0; batch < batches; ++batch) {
+    // -------------------------
+    // Build im2col for this batch (columns 0..N-1)
+    // -------------------------
+    int col_idx = 0;
+    int stride_height_sum = 0;
     for (int out_y = 0; out_y < output_height; ++out_y) {
-      int in_y_origin = stride_height_sum - pad_height;
+      const int in_y_origin = stride_height_sum - pad_height;
       int stride_width_sum = 0;
+
       for (int out_x = 0; out_x < output_width; ++out_x) {
-        int in_x_origin = stride_width_sum - pad_width;
+        const int in_x_origin = stride_width_sum - pad_width;
+
         int row_idx = 0;
-        int in_y = in_y_origin; 
+        int in_y = in_y_origin;
+
         for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
           int in_x = in_x_origin;
+
           for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
             for (int in_channel = 0; in_channel < input_depth; ++in_channel) {
               int8_t val = 0;
-              bool is_point_inside_image =
-                    (in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
-                    (in_y < input_height);
-              if (is_point_inside_image) {
-                int8_t real_val = input_data[Offset(input_shape, 0, in_y, in_x, in_channel)];
-                val = static_cast<int8_t>(real_val);
+              const bool inside =
+                  (in_x >= 0) && (in_x < input_width) &&
+                  (in_y >= 0) && (in_y < input_height);
+
+              if (inside) {
+                const int8_t real_val =
+                    input_data[Offset(input_shape, batch, in_y, in_x, in_channel)];
+                val = real_val;
               } else {
-                val = static_cast<int8_t>(-input_offset);; 
+                // padding uses q = input_zero_point = -input_offset
+                val = static_cast<int8_t>(-input_offset);
               }
 
-              im2col[row_idx][col_idx] = val;
+              if (row_idx < IM2COL_MAX_K && col_idx < IM2COL_MAX_N) {
+                im2col[row_idx][col_idx] = val;
+              }
               row_idx++;
             }
             in_x += dilation_width_factor;
           }
           in_y += dilation_height_factor;
         }
+
         col_idx++;
         stride_width_sum += stride_width;
       }
-      stride_height_sum += stride_height; 
+      stride_height_sum += stride_height;
     }
 
+    // -------------------------
+    // Precompute offset correction for each output channel
+    // -------------------------
     for (int m = 0; m < M; ++m) {
-      int k_idx = 0;
+      const int8_t* fbase = filter_data + Offset(filter_shape, m, 0, 0, 0);
       int32_t sum = 0;
-      for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
-        for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
-          for (int in_channel = 0; in_channel < input_depth; ++in_channel) {
-            int8_t filter_val = filter_data[Offset(filter_shape, m, filter_y, filter_x, in_channel)];
-            kernel[m][k_idx] = filter_val;
-            sum += filter_val;
-            k_idx++;
-          }
-        }
-      }
-      int32_t tmp = sum * input_offset;
-      for(int n = 0; n < N; ++n) {
-        cfu_result[m][n] = tmp;
-      }
+      for (int kk = 0; kk < K; ++kk) sum += fbase[kk];
+      offset_correction[m] = sum * input_offset;
     }
-    
-    const int TILE_SIZE = 256;
-    
-    for (int m = 0; m < M; m += TILE_SIZE) {
-      for (int n = 0; n < N; n += TILE_SIZE) {
-        for (int k = 0; k < K; k += TILE_SIZE) {
-          // send to im2col buffer
-          uint32_t addr = 0; 
-          for (int tn = 0; tn < TILE_SIZE; tn += 4) {
-            for (int tk = 0; tk < TILE_SIZE; tk += 4) { 
-              for(int r = 0; r < 4; ++r) {
+
+    // -------------------------
+    // Tiled GEMM using CFU/TPU
+    // -------------------------
+    for (int m0 = 0; m0 < M; m0 += TM) {
+      const int m_tile = std::min(TM, M - m0);
+      // Key fix: run only effective M on TPU for the last tile (4-row aligned)
+      const int tm_eff_aligned = (m_tile + 3) & ~3;  // multiple of 4
+
+      for (int n0 = 0; n0 < N; n0 += TN) {
+        const int n_tile = std::min(TN, N - n0);
+        const int tn_eff_aligned = (n_tile + 3) & ~3;  // multiple of 4
+
+        // Accumulate across K blocks.
+        for (int k0 = 0; k0 < K; k0 += TK) {
+          const int k_tile = std::min(TK, K - k0);
+          const int tk_eff_aligned = (k_tile + 3) & ~3;  // multiple of 4
+
+          // 1) send weights -> A buffer, build local-k allzero mask
+          uint8_t k_nonzero[TK];
+          for (int i = 0; i < TK; ++i) k_nonzero[i] = 0;
+          bool block_has_any_weight = false;
+
+          uint32_t addrA = 0;
+          for (int tm = 0; tm < tm_eff_aligned; tm += 4) {
+            const int gm0 = m0 + tm + 0;
+            const int gm1 = m0 + tm + 1;
+            const int gm2 = m0 + tm + 2;
+            const int gm3 = m0 + tm + 3;
+
+            const int8_t* f0 = (gm0 < M) ? (filter_data + Offset(filter_shape, gm0, 0, 0, 0)) : nullptr;
+            const int8_t* f1 = (gm1 < M) ? (filter_data + Offset(filter_shape, gm1, 0, 0, 0)) : nullptr;
+            const int8_t* f2 = (gm2 < M) ? (filter_data + Offset(filter_shape, gm2, 0, 0, 0)) : nullptr;
+            const int8_t* f3 = (gm3 < M) ? (filter_data + Offset(filter_shape, gm3, 0, 0, 0)) : nullptr;
+
+            for (int tk = 0; tk < tk_eff_aligned; tk += 4) {
+              for (int r = 0; r < 4; ++r) {
+                const int local_k = tk + r;          // 0..TK-1
+                const int cur_k = k0 + local_k;      // 0..K-1 (or padded)
+
                 uint32_t packed_val = 0;
-                int cur_n = n + tn; 
-                int cur_k = k + tk + r;     
-                packed_val = *reinterpret_cast<const uint32_t*>(im2col[cur_k]+cur_n);
-                packed_val = __builtin_bswap32(packed_val);
-                cfu_op0(0, packed_val, (1<<24) + addr);    
-                addr++;
-              }    
-            }
-          }
-          // send to kernel buffer
-          addr = 0; 
-          for (int tm = 0; tm < TILE_SIZE; tm += 4) {
-            for (int tk = 0; tk < TILE_SIZE; tk+=4) {
-              for(int r = 0; r < 4; ++r) {
-                uint32_t packed_val = 0;
-                int cur_k = k + tk + r; 
-                for (int i = 0; i < 4; ++i) {
-                  int cur_m = m + tm + i; 
-                  int8_t val = 0;
-                  if (cur_m < M && cur_k < K) {
-                    val = kernel[cur_m][cur_k];
-                  }
-                  packed_val |= ((uint32_t)((uint8_t)val)) << ((4-i-1) <<3);
+                if (cur_k < K) {
+                  const uint8_t v0 = (f0) ? static_cast<uint8_t>(f0[cur_k]) : 0;
+                  const uint8_t v1 = (f1) ? static_cast<uint8_t>(f1[cur_k]) : 0;
+                  const uint8_t v2 = (f2) ? static_cast<uint8_t>(f2[cur_k]) : 0;
+                  const uint8_t v3 = (f3) ? static_cast<uint8_t>(f3[cur_k]) : 0;
+                  packed_val = (static_cast<uint32_t>(v0) << 24) |
+                               (static_cast<uint32_t>(v1) << 16) |
+                               (static_cast<uint32_t>(v2) <<  8) |
+                               (static_cast<uint32_t>(v3) <<  0);
                 }
-                cfu_op0(0, packed_val, addr); 
-                addr++;
+
+                if (packed_val != 0) {
+                  k_nonzero[local_k] = 1;
+                  block_has_any_weight = true;
+                }
+
+#if CFU_CONV_USE_WRITE_CACHE
+                if (packed_val != lastA[addrA]) {
+                  cfu_op0(0, packed_val, addrA);
+                  lastA[addrA] = packed_val;
+                }
+#else
+                cfu_op0(0, packed_val, addrA);
+#endif
+                addrA++;
               }
             }
           }
-          // receive from output buffer
-          cfu_op0(1,TILE_SIZE|(TILE_SIZE<<16),(TILE_SIZE));
 
-          uint32_t num_row_blocks = TILE_SIZE / 4; 
-          for (uint32_t i = 0; i < TILE_SIZE; i++) { 
-            uint32_t block_row = i >> 2; 
-            uint32_t inner_row = i % 4; 
-            for (uint32_t j = 0; j < TILE_SIZE; j++) { 
-              uint32_t block_col = j >> 2; 
-              
-              uint32_t buffer_index = ((block_col * num_row_blocks + block_row) << 2) + inner_row;
-              
-              uint32_t offset = j % 4;
-
-              int32_t ret = static_cast<int32_t>(cfu_op0(2, buffer_index, offset));
-
-              int global_m = m + i;
-              int global_n = n + j;
-
-              if (global_m < M && global_n < N) { 
-                cfu_result[global_m][global_n] += ret; 
+          // If all weights in this K-block are zero, skip B+TPU+read entirely.
+          if (!block_has_any_weight) {
+            if (k0 == 0) {
+              // first block: clear tile_acc to 0 for valid region
+              int idx_base = 0;
+              for (int i = 0; i < m_tile; ++i) {
+                for (int j = 0; j < n_tile; j+=4) {
+                  tile_acc[idx_base + j] = 0;
+                  tile_acc[idx_base + j + 1] = 0;
+                  tile_acc[idx_base + j + 2] = 0;
+                  tile_acc[idx_base + j + 3] = 0;
+                }
+                idx_base += n_tile;
               }
             }
+            continue;
+          }
+
+          // 2) send im2col -> B buffer (only TN_eff x TK_eff)
+          uint32_t addrB = 0;
+          for (int tn = 0; tn < tn_eff_aligned; tn += 4) {
+            for (int tk = 0; tk < tk_eff_aligned; tk += 4) {
+              for (int r = 0; r < 4; ++r) {
+                const int local_k = tk + r;
+                const int cur_k = k0 + local_k;
+
+#if CFU_CONV_SKIP_B_IF_ALLZERO_K
+                if (!k_nonzero[local_k]) {
+                  addrB++;
+                  continue;
+                }
+#endif
+                uint32_t packed_val = 0;
+
+                if (cur_k < K) {
+                  const int cur_n = n0 + tn;
+                  if (cur_n + 3 < N) {
+                    // Fast path: 4 bytes contiguous (tn is multiple of 4)
+                    packed_val = *reinterpret_cast<const uint32_t*>(im2col[cur_k] + cur_n);
+                    packed_val = __builtin_bswap32(packed_val);
+                  } else {
+                    // Tail-safe packing
+                    uint8_t b[4];
+                    for (int t = 0; t < 4; ++t) {
+                      const int nn = cur_n + t;
+                      b[t] = (nn < N) ? static_cast<uint8_t>(im2col[cur_k][nn])
+                                      : static_cast<uint8_t>(-input_offset);
+                    }
+                    packed_val = (static_cast<uint32_t>(b[0]) << 24) |
+                                 (static_cast<uint32_t>(b[1]) << 16) |
+                                 (static_cast<uint32_t>(b[2]) <<  8) |
+                                 (static_cast<uint32_t>(b[3]) <<  0);
+                  }
+                } else {
+                  packed_val = 0;
+                }
+
+#if CFU_CONV_USE_WRITE_CACHE
+                if (packed_val != lastB[addrB]) {
+                  cfu_op0(0, packed_val, (1u << 24) + addrB);
+                  lastB[addrB] = packed_val;
+                }
+#else
+                cfu_op0(0, packed_val, (1u << 24) + addrB);
+#endif
+                addrB++;
+              }
+            }
+          }
+
+          // 3) compute on TPU with effective dims
+          cfu_op0(1, (uint32_t)tm_eff_aligned | ((uint32_t)tn_eff_aligned << 16),
+                  (uint32_t)tk_eff_aligned);
+
+          // 4) read back only valid region (m_tile x n_tile)
+          const uint32_t num_row_blocks = (uint32_t)(tm_eff_aligned >> 2);
+          uint32_t idx_base = 0;
+          for (uint32_t i = 0; i < (uint32_t)m_tile; ++i) {
+            const uint32_t block_row = i >> 2;
+            const uint32_t inner_row = i & 3;
+            uint32_t block_base = 0;
+            for (uint32_t j = 0; j < (uint32_t)n_tile; j+=4) {
+              const uint32_t buffer_index =
+                  ((block_base + block_row) << 2) + inner_row;
+              int32_t ret =
+                  static_cast<int32_t>(cfu_op0(2, buffer_index, 0));
+              uint32_t idx = idx_base + j;
+              if (k0 == 0) tile_acc[idx] = ret;
+              else         tile_acc[idx] += ret;
+              ret =
+                  static_cast<int32_t>(cfu_op0(2, buffer_index, 1));
+              idx++;
+              if (k0 == 0) tile_acc[idx] = ret;
+              else         tile_acc[idx] += ret;
+              ret =
+                  static_cast<int32_t>(cfu_op0(2, buffer_index, 2));
+              idx++;
+              if (k0 == 0) tile_acc[idx] = ret;
+              else         tile_acc[idx] += ret;
+              ret =
+                  static_cast<int32_t>(cfu_op0(2, buffer_index, 3));
+              idx++;
+              if (k0 == 0) tile_acc[idx] = ret;
+              else         tile_acc[idx] += ret;
+              block_base += num_row_blocks;
+            }
+            idx_base += (uint32_t)TN;
+          }
+        }  // k0 loop end
+
+        // -------------------------
+        // Postprocess + write outputs for this tile
+        // acc = dot(filter, input) + sum(filter)*input_offset + bias
+        // -------------------------
+        // Precompute output base offsets (channel 0) for columns in this tile.
+        // This avoids per-element divisions/mods and repeated Offset() calls.
+        int out_y = n0 / output_width;
+        int out_x = n0 - out_y * output_width;
+        int out_base[TN];  // only first n_tile entries used
+        for (int j = 0; j < n_tile; ++j) {
+          out_base[j] = Offset(output_shape, batch, out_y, out_x, 0);
+          perv = out_base[j];
+          prevv = out_base[j] - perv;
+          ++out_x;
+          if (out_x == output_width) {
+            out_x = 0;
+            ++out_y;
           }
         }
-      }
-    }
-    for (int m = 0; m < M; ++m) {
-      for (int n = 0; n < N; ++n) {
-        int32_t acc = cfu_result[m][n];
-
+        uint32_t row_base = 0;
         if (bias_data) {
-          acc += bias_data[m];
+          for (int i = 0; i < m_tile; ++i) {
+            const int out_c = m0 + i;
+            const int32_t corr = offset_correction[out_c];
+            const int32_t bias = bias_data[out_c];
+            const int32_t mult = output_multiplier[out_c];
+            const int32_t shift = output_shift[out_c];
+            for (int j = 0; j < n_tile; ++j) {
+              int32_t acc = tile_acc[row_base + (uint32_t)j] + corr + bias;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j] + out_c] = static_cast<int8_t>(acc);
+            }
+            row_base += (uint32_t)TN;
+          }
+        } else {
+          for (int i = 0; i < m_tile; ++i) {
+            const int out_c = m0 + i;
+            const int32_t corr = offset_correction[out_c];
+            const int32_t mult = output_multiplier[out_c];
+            const int32_t shift = output_shift[out_c];
+            for (int j = 0; j < n_tile; ++j) {
+              int32_t acc = tile_acc[row_base + (uint32_t)j] + corr;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j] + out_c] = static_cast<int8_t>(acc);
+            }
+            row_base += (uint32_t)TN;
+          }
         }
-        acc = MultiplyByQuantizedMultiplier(
-        acc, output_multiplier[m], output_shift[m]);
-        acc += output_offset;
-        acc = std::max(acc, output_activation_min);
-        acc = std::min(acc, output_activation_max);
-        int out_y = n / output_width;
-        int out_x = n % output_width;
-        output_data[Offset(output_shape, batch, out_y, out_x, m)] = static_cast<int8_t>(acc);
-      }
-    }
-  }
+}  // n0 loop end
+    }    // m0 loop end
+  }      // batch loop end
 }
 
 inline void ConvPerChannelWithPackedInt4Weights(
@@ -301,7 +435,7 @@ inline void ConvPerChannelWithPackedInt4Weights(
 }
 
 // Fixed-point per-channel-quantization convolution reference kernel.
-// 16-bit data and 8-bit filter
+// 16-bit data and 8-bit filter (KEEP stock reference implementation)
 template <typename AccumScalar>
 inline void ConvPerChannel(
     const ConvParams& params, const int32_t* output_multiplier,
@@ -358,14 +492,11 @@ inline void ConvPerChannel(
             for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
               const int in_x = in_x_origin + dilation_width_factor * filter_x;
 
-              // Zero padding by omitting the areas outside the image.
-              const bool is_point_inside_image =
-                  (in_x >= 0) && (in_x < input_width) && (in_y >= 0) &&
-                  (in_y < input_height);
+              const bool inside =
+                  (in_x >= 0) && (in_x < input_width) &&
+                  (in_y >= 0) && (in_y < input_height);
 
-              if (!is_point_inside_image) {
-                continue;
-              }
+              if (!inside) continue;
 
               for (int in_channel = 0; in_channel < filter_input_depth;
                    ++in_channel) {
@@ -374,19 +505,11 @@ inline void ConvPerChannel(
                                       in_channel + group * filter_input_depth)];
                 int32_t filter_val = filter_data[Offset(
                     filter_shape, out_channel, filter_y, filter_x, in_channel)];
-                // Accumulate with 64 bits accumulator.
-                // int64_t += int8_t * int16_t so the highest value we can
-                // get from each accumulation is [-127, 127] * ([-32768,
-                // 32767] -
-                // [-32768, 32767]), which is [-8322945, 8322945].
-                // log2(8322945) = 22.99.
                 acc += filter_val * input_val;
               }
             }
           }
-          if (bias_data) {
-            acc += bias_data[out_channel];
-          }
+          if (bias_data) acc += bias_data[out_channel];
           int32_t scaled_acc = MultiplyByQuantizedMultiplier(
               acc, output_multiplier[out_channel], output_shift[out_channel]);
           scaled_acc = std::max(scaled_acc, output_activation_min);
