@@ -385,13 +385,31 @@ inline void ConvPerChannel(
             const int32_t bias = bias_data[out_c];
             const int32_t mult = output_multiplier[out_c];
             const int32_t shift = output_shift[out_c];
-            for (int j = 0; j < n_tile; ++j) {
+            for (int j = 0; j < n_tile; j+=4) {
               int32_t acc = tile_acc[row_base + (uint32_t)j] + corr + bias;
               acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
               acc += output_offset;
               acc = std::max(acc, output_activation_min);
               acc = std::min(acc, output_activation_max);
               output_data[out_base[j] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+1] + corr + bias;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+1] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+2] + corr + bias;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+2] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+3] + corr + bias;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+3] + out_c] = static_cast<int8_t>(acc);
             }
             row_base += (uint32_t)TN;
           }
@@ -401,13 +419,31 @@ inline void ConvPerChannel(
             const int32_t corr = offset_correction[out_c];
             const int32_t mult = output_multiplier[out_c];
             const int32_t shift = output_shift[out_c];
-            for (int j = 0; j < n_tile; ++j) {
+            for (int j = 0; j < n_tile; j+=4) {
               int32_t acc = tile_acc[row_base + (uint32_t)j] + corr;
               acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
               acc += output_offset;
               acc = std::max(acc, output_activation_min);
               acc = std::min(acc, output_activation_max);
               output_data[out_base[j] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+1] + corr;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+1] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+2] + corr;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+2] + out_c] = static_cast<int8_t>(acc);
+              acc = tile_acc[row_base + (uint32_t)j+3] + corr;
+              acc = MultiplyByQuantizedMultiplier(acc, mult, shift);
+              acc += output_offset;
+              acc = std::max(acc, output_activation_min);
+              acc = std::min(acc, output_activation_max);
+              output_data[out_base[j+3] + out_c] = static_cast<int8_t>(acc);
             }
             row_base += (uint32_t)TN;
           }
