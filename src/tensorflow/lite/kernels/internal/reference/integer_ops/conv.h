@@ -371,8 +371,6 @@ inline void ConvPerChannel(
         int out_base[TN];  // only first n_tile entries used
         for (int j = 0; j < n_tile; ++j) {
           out_base[j] = Offset(output_shape, batch, out_y, out_x, 0);
-          perv = out_base[j];
-          prevv = out_base[j] - perv;
           ++out_x;
           if (out_x == output_width) {
             out_x = 0;
